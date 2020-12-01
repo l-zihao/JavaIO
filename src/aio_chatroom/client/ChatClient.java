@@ -4,55 +4,49 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.ClosedSelectorException;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.SocketChannel;
+import java.nio.channels.AsynchronousSocketChannel;
+import java.nio.channels.CompletionHandler;
 import java.nio.charset.Charset;
-import java.util.Set;
 
 public class ChatClient {
 
-    private static final String DEFAULT_SERVER_HOST = "127.0.0.1";
-
-    private static final int DEFAULT_SERVER_PORT = 7777;
-
+    private static final String LOCALHOST = "localhost";
+    private static final int DEFAULT_PORT = 8888;
     private static final String QUIT = "quit";
-
     private static final int BUFFER = 1024;
 
+    private AsynchronousSocketChannel clientChannel;
+    private RWHandler handler;
+    private Charset charset = Charset.forName("UTF-8");
     private String host;
-
     private int port;
 
-    private SocketChannel client;
+    public ChatClient(){
+        this(LOCALHOST , DEFAULT_PORT);
+    }
 
-    private Selector selector;
-
-    private ByteBuffer rBuffer = ByteBuffer.allocate(BUFFER);
-
-    private ByteBuffer wBuffer = ByteBuffer.allocate(BUFFER);
-
-    private Charset charset = Charset.forName("UTF-8");
-
-    public ChatClient(String host, int port){
+    public ChatClient(String host, int port) {
         this.host = host;
         this.port = port;
     }
 
-    public ChatClient(){
-        this(DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT);
-    }
-
-
     public boolean readyToQuit(String msg){
-        return QUIT.equals(msg);
+        boolean flag = QUIT.equalsIgnoreCase(msg);
+        if(flag){
+            close(clientChannel);
+        }
+        return flag;
     }
 
-    public void close(Closeable closeable){
+    public synchronized void send(String msg){
+        ByteBuffer buffer = charset.encode(msg);
+        clientChannel.write(buffer , null , handler);
+        buffer.clear();
+    }
+
+    private synchronized void close(Closeable closeable){
         if(closeable != null){
             try {
-                System.out.println("关闭socket");
                 closeable.close();
             } catch (IOException e) {
                 e.printStackTrace();
@@ -60,84 +54,82 @@ public class ChatClient {
         }
     }
 
-    public void start(){
-        try {
-            client = SocketChannel.open();
-            client.configureBlocking(false);
+    private class ConnectHandler implements CompletionHandler<Void , Object> {
 
-            selector = Selector.open();
-            client.register(selector, SelectionKey.OP_CONNECT);
-            client.connect(new InetSocketAddress(host, port));
+        private ChatClient client;
 
-            while(true){
-                selector.select();
-                Set<SelectionKey> selectionKeys = selector.selectedKeys();
-                for (SelectionKey selectionKey : selectionKeys) {
-                    handles(selectionKey);
+        public ConnectHandler(ChatClient client) {
+            this.client = client;
+        }
+
+        @Override
+        public void completed(Void result, Object attachment) {
+            handler = new RWHandler(clientChannel);
+            ByteBuffer buffer = ByteBuffer.allocate(BUFFER);
+            // 异步调用read ， 当服务器有消息转发给该用户，便触发回调函数
+            clientChannel.read(buffer , buffer , handler);
+            // 创建线程监听用户输入信息
+            new Thread(new UserInputHandler(client)).start();
+        }
+
+        @Override
+        public void failed(Throwable exc, Object attachment) {
+            System.out.println("客户端连接失败");
+        }
+    }
+
+    private class RWHandler implements CompletionHandler<Integer , Object>{
+
+        private AsynchronousSocketChannel clientChannel;
+
+        public RWHandler(AsynchronousSocketChannel clientChannel) {
+            this.clientChannel = clientChannel;
+        }
+
+        @Override
+        public void completed(Integer result, Object attachment) {
+            ByteBuffer buffer = (ByteBuffer) attachment;
+            // 读取服务器转发的消息成功
+            if(buffer != null){
+                // 读取的消息有效
+                if(result > 0){
+                    // 读模式
+                    buffer.flip();
+                    String msg = String.valueOf(charset.decode(buffer));
+                    System.out.println(msg);
+                    // 写模式
+                    buffer.clear();
+                    // 再异步调用read，相当于一直在监听服务器是否转发消息过来（异常除外）
+                    clientChannel.read(buffer , buffer , this);
                 }
-                selectionKeys.clear();
+            }
+        }
+
+        @Override
+        public void failed(Throwable exc, Object attachment) {
+            // 简单处理为客户端与服务器断开连接
+            close(clientChannel);
+        }
+    }
+
+    private void start(){
+        try {
+            // 打开管道
+            clientChannel = AsynchronousSocketChannel.open();
+            // 异步调用connect连接服务器
+            clientChannel.connect(new InetSocketAddress(host , port) , null , new ConnectHandler(this));
+            while(clientChannel.isOpen()){
+                // 这里没想到好方法来替代这个循坏
             }
         } catch (IOException e) {
             e.printStackTrace();
-        } catch (ClosedSelectorException e) {
-            // 用户正常退出
         } finally {
-            close(selector);
+            close(clientChannel);
         }
-    }
-
-    public void send(String msg) throws IOException {
-        if(msg.isEmpty()){
-           return;
-        }
-
-        wBuffer.clear();
-        wBuffer.put(charset.encode(msg));
-        wBuffer.flip();
-        while (wBuffer.hasRemaining()){
-            client.write(wBuffer);
-        }
-
-        //检查用户是否准备退出
-        if(readyToQuit(msg)){
-            close(selector);
-        }
-    }
-
-    private void handles(SelectionKey selectionKey) throws IOException {
-        //CONNECT事件 - 连接就绪事件
-        if(selectionKey.isConnectable()){
-            SocketChannel client = (SocketChannel)selectionKey.channel();
-            if(client.isConnectionPending()){
-                client.finishConnect();
-                //处理用户输入
-                new Thread(new UserInputHandler(this)).start();
-            }
-            client.register(selector, SelectionKey.OP_READ);
-        }
-        //READ事件 - 服务器转发消息
-        else if(selectionKey.isReadable()){
-            SocketChannel client = (SocketChannel)selectionKey.channel();
-            String msg = receive(client);
-
-            if(msg.isEmpty()){
-                //服务器异常
-                close(selector);
-            }else{
-                System.out.println(msg);
-            }
-        }
-    }
-
-    private String receive(SocketChannel client) throws IOException {
-        rBuffer.clear();
-        while(client.read(rBuffer) > 0);
-        rBuffer.flip();
-        return String.valueOf(charset.decode(rBuffer));
     }
 
     public static void main(String[] args) {
-        ChatClient chatClient = new ChatClient("127.0.0.1", 7777);
-        chatClient.start();
+        ChatClient client = new ChatClient();
+        client.start();
     }
 }
